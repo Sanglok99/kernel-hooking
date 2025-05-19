@@ -32,6 +32,8 @@ unsigned int my_find_next_fd(struct fdtable *fdt, unsigned int start)
 	unsigned int maxfd = fdt->max_fds;
 	unsigned int maxbit = maxfd / BITS_PER_LONG;
 	unsigned int bitbit = start / BITS_PER_LONG;
+    
+    printk("[%s]: maxfd: %d, start: %d", __func__, maxfd, start);
 
 	bitbit = find_next_zero_bit(fdt->full_fds_bits, maxbit, bitbit) * BITS_PER_LONG;
 	if (bitbit > maxfd)
@@ -59,7 +61,7 @@ repeat:
 		fd = files->next_fd;
         printk("[%s]: fd(1): %d\n", __func__, fd);
 	if (fd < fdt->max_fds)
-		fd = my_find_next_fd(fdt, fd);
+		fd = my_find_next_fd(fdt, fd); // checks all fds at the bit level, and return the first encountered unallocated fd
         printk("[%s]: fd(2): %d\n", __func__, fd);
 	/*
 	 * N.B. For clone tasks sharing a files structure, this test

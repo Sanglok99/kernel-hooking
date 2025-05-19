@@ -30,6 +30,34 @@
 
 #define __getname()     kmem_cache_alloc(names_cachep, GFP_KERNEL)
 #define EMBEDDED_NAME_MAX	(PATH_MAX - offsetof(struct filename, iname))
+#define ND_ROOT_PRESET 1
+#define ND_ROOT_GRABBED 2
+#define ND_JUMPED 4
+#define EMBEDDED_LEVELS 2
+
+struct nameidata {
+    struct path path;
+    struct qstr last;
+    struct path root;
+    struct inode    *inode; /* path.dentry.d_inode */
+    unsigned int    flags, state;
+    unsigned    seq, next_seq, m_seq, r_seq;
+    int     last_type;
+    unsigned    depth;
+    int     total_link_count;
+    struct saved {
+        struct path link;
+        struct delayed_call done;
+        const char *name;
+        unsigned seq;
+    } *stack, internal[EMBEDDED_LEVELS];
+    struct filename *name;
+    struct nameidata *saved;
+    unsigned    root_seq;
+    int     dfd;
+    vfsuid_t    dir_vfsuid;
+    umode_t     dir_mode;
+} __randomize_layout;
 
 struct icc_req {
     struct hlist_node req_node;
@@ -49,164 +77,18 @@ struct icc_path {
 
 extern int do_tmpfile(struct nameidata *nd, unsigned flags, const struct open_flags *op, struct file *file);
 extern int do_o_path(struct nameidata *nd, unsigned flags, struct file *file);
-extern struct icc_path *path_init(struct device *dev, struct icc_node *dst, ssize_t num_nodes);
 extern int link_path_walk(const char *name, struct nameidata *nd);
 extern const char *open_last_lookups(struct nameidata *nd, struct file *file, const struct open_flags *op);
-extern int do_open(struct inode *inode, struct file *filp);
 extern void terminate_walk(struct nameidata *nd); 
 extern void set_nameidata(struct nameidata *p, int dfd, struct filename *name, const struct path *root);
 extern void restore_nameidata(void);
-
-struct filename* my_getname_flags(const char __user *filename, int flags, int *empty)
-{
-	struct filename *result;
-	char *kname;
-	int len;
-
-    // remove audit system code
-	// result = audit_reusename(filename);
-	// if (result) return result;
-
-	result = __getname(); // allocates memory in the kernel space.
-                          // returns a void pointer
-	if (unlikely(!result))
-		return ERR_PTR(-ENOMEM);
-
-	/*
-	 * First, try to embed the struct filename inside the names_cache
-	 * allocation
-	 */
-	kname = (char *)result->iname;
-    printk("[%s]: kname: %c\n", __func__, *kname);
-	result->name = kname;
-
-	len = strncpy_from_user(kname, filename, EMBEDDED_NAME_MAX);
-	if (unlikely(len < 0)) {
-		__putname(result);
-		return ERR_PTR(len);
-	}
-
-	/*
-	 * Uh-oh. We have a name that's approaching PATH_MAX. Allocate a
-	 * separate struct filename so we can dedicate the entire
-	 * names_cache allocation for the pathname, and re-do the copy from
-	 * userland.
-	 */
-	if (unlikely(len == EMBEDDED_NAME_MAX)) {
-		const size_t size = offsetof(struct filename, iname[1]);
-		kname = (char *)result;
-
-		/*
-		 * size is chosen that way we to guarantee that
-		 * result->iname[0] is within the same object and that
-		 * kname can't be equal to result->iname, no matter what.
-		 */
-		result = kzalloc(size, GFP_KERNEL);
-		if (unlikely(!result)) {
-			__putname(kname);
-			return ERR_PTR(-ENOMEM);
-		}
-		result->name = kname;
-		len = strncpy_from_user(kname, filename, PATH_MAX);
-		if (unlikely(len < 0)) {
-			__putname(kname);
-			kfree(result);
-			return ERR_PTR(len);
-		}
-		if (unlikely(len == PATH_MAX)) {
-			__putname(kname);
-			kfree(result);
-			return ERR_PTR(-ENAMETOOLONG);
-		}
-	}
-
-	atomic_set(&result->refcnt, 1);
-	/* The empty path is special. */
-	if (unlikely(!len)) {
-		if (empty)
-			*empty = 1;
-		if (!(flags & LOOKUP_EMPTY)) {
-			putname(result);
-			return ERR_PTR(-ENOENT);
-		}
-	}
-
-	result->uptr = filename;
-	result->aname = NULL;
-    // remove audit system code
-	// audit_getname(result);
-	return result;
-}
-
-// allocates memory in the kernel for the filename and returns a pointer to the filename
-struct filename* my_getname(const char __user * filename)
-{
-	return my_getname_flags(filename, 0, NULL);
-}
-
-// obtains the file object corresponding to the incoming pathname
-// searches the file along a path and return the file
-static struct file* my_path_openat(struct nameidata *nd, const struct open_flags *op, unsigned flags)
-{
-    printk("[%s]: my_path_openat()\n", __func__);
-	struct file *file;
-	int error;
-
-	file = alloc_empty_file(op->open_flag, current_cred()); // allocate memory to the struct file
-	if (IS_ERR(file))
-		return file;
-
-	if (unlikely(file->f_flags & __O_TMPFILE)) {
-		error = do_tmpfile(nd, flags, op, file);
-	} else if (unlikely(file->f_flags & O_PATH)) {
-		error = do_o_path(nd, flags, file);
-	} else {
-		const char *s = path_init(nd, flags); // initialize the nameidata structure
-        printk("[%s]: the initialized nameidata: %c\n", __func__, *s);
-		while (!(error = link_path_walk(s, nd)) &&
-		       (s = open_last_lookups(nd, file, op)) != NULL)
-			;
-		if (!error)
-			error = do_open(nd, file, op);
-		terminate_walk(nd);
-	}
-	if (likely(!error)) {
-		if (likely(file->f_mode & FMODE_OPENED))
-			return file;
-		WARN_ON(1);
-		error = -EINVAL;
-	}
-	fput(file);
-	if (error == -EOPENSTALE) {
-		if (flags & LOOKUP_RCU)
-			error = -ECHILD;
-		else
-			error = -ESTALE;
-	}
-	return ERR_PTR(error);
-}
-
-// gets the file struct
-struct file* my_do_filp_open(int dfd, struct filename *pathname,const struct open_flags *op)
-{
-	printk("[%s]: start my_do_filp_open", __func__);
-    struct nameidata nd; // additional study required
-	int flags = op->lookup_flags;
-	struct file *filp;
-
-	set_nameidata(&nd, dfd, pathname, NULL); // additional study required 
-	filp = my_path_openat(&nd, op, flags | LOOKUP_RCU); // obtains the file object corresponding to the incoming pathname
-	if (unlikely(filp == ERR_PTR(-ECHILD)))
-		filp = my_path_openat(&nd, op, flags);
-	if (unlikely(filp == ERR_PTR(-ESTALE)))
-		filp = my_path_openat(&nd, op, flags | LOOKUP_REVAL);
-	restore_nameidata();
-	return filp;
-}
-
+extern struct file *alloc_empty_file(int flags, const struct cred *cred);
+extern int do_open(struct nameidata *nd, struct file *file, const struct open_flags *op);
+extern int nd_jump_root(struct nameidata *nd);
+extern unsigned long __fdget_raw(unsigned int fd);
 
 /* must be paired with terminate_walk() */
-static const char *path_init(struct nameidata *nd, unsigned flags)
+static const char *my_path_init(struct nameidata *nd, unsigned flags)
 {
 	int error;
 	const char *s = nd->name->name;
@@ -308,3 +190,69 @@ static const char *path_init(struct nameidata *nd, unsigned flags)
     }
     return s;
 }
+
+// obtains the file object corresponding to the incoming pathname
+// searches the file along a path and return the file
+struct file* my_path_openat(struct nameidata *nd, const struct open_flags *op, unsigned flags)
+{
+    printk("[%s]: my_path_openat()\n", __func__);
+	struct file *file;
+	int error;
+
+	file = alloc_empty_file(op->open_flag, current_cred()); // allocate memory to the struct file
+	if (IS_ERR(file))
+		return file;
+
+	if (unlikely(file->f_flags & __O_TMPFILE)) {
+		error = do_tmpfile(nd, flags, op, file);
+	} else if (unlikely(file->f_flags & O_PATH)) {
+		error = do_o_path(nd, flags, file);
+	} else {
+		const char *s = my_path_init(nd, flags); // initialize the nameidata structure
+        printk("[%s]: the initialized nameidata: %c\n", __func__, *s);
+		while (!(error = link_path_walk(s, nd)) &&
+		       (s = open_last_lookups(nd, file, op)) != NULL)
+			;
+		if (!error)
+			error = do_open(nd, file, op);
+		terminate_walk(nd);
+	}
+	if (likely(!error)) {
+		if (likely(file->f_mode & FMODE_OPENED))
+			return file;
+		WARN_ON(1);
+		error = -EINVAL;
+	}
+	fput(file);
+	if (error == -EOPENSTALE) {
+		if (flags & LOOKUP_RCU)
+			error = -ECHILD;
+		else
+			error = -ESTALE;
+	}
+	return ERR_PTR(error);
+}
+EXPORT_SYMBOL(my_path_openat);
+
+// gets the file struct corresponding to the filename
+// parameters:
+// return: file struct
+struct file *my_do_filp_open(int dfd, struct filename *pathname, const struct open_flags *op)
+{
+    printk("[%s]: start my_do_filp_open", __func__);
+    struct nameidata nd;
+    int flags = op->lookup_flags;
+    struct file *filp;
+
+    set_nameidata(&nd, dfd, pathname, NULL);
+    printk("[%s]: (set_nameidate)total_link_count: %d\n", __func__, nd.total_link_count);
+    filp = my_path_openat(&nd, op, flags | LOOKUP_RCU);
+    if (unlikely(filp == ERR_PTR(-ECHILD)))
+        filp = my_path_openat(&nd, op, flags);
+    if (unlikely(filp == ERR_PTR(-ESTALE)))
+        filp = my_path_openat(&nd, op, flags | LOOKUP_REVAL);
+    restore_nameidata();
+    printk("[%s]: finished restore_nameidata(): ", __func__);
+    return filp;
+}
+EXPORT_SYMBOL(my_do_filp_open);

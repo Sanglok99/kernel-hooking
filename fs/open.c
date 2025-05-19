@@ -39,91 +39,10 @@ extern int do_o_path(struct nameidata *nd, unsigned flags, struct file *file);
 extern int link_path_walk(const char *name, struct nameidata *nd);
 extern const char *path_init(struct nameidata *nd, unsigned flags);
 extern const char *open_last_lookups(struct nameidata *nd, struct file *file, const struct open_flags *op);
-extern int do_open(struct nameidata *nd, struct file *file, const struct open_flags *op);
 extern void terminate_walk(struct nameidata *nd);
+extern struct file *my_do_filp_open(int dfd, struct filename *pathname, const struct open_flags *op);
+extern struct file* my_path_openat(struct nameidata *nd, const struct open_flags *op, unsigned flags);
 
-#define EMBEDDED_LEVELS 2
-struct nameidata {
-    struct path path;
-    struct qstr last;
-    struct path root;
-    struct inode    *inode; /* path.dentry.d_inode */
-    unsigned int    flags, state;
-    unsigned    seq, next_seq, m_seq, r_seq;
-    int     last_type;
-    unsigned    depth;
-    int     total_link_count;
-    struct saved {
-        struct path link;
-        struct delayed_call done;
-        const char *name;
-        unsigned seq;
-    } *stack, internal[EMBEDDED_LEVELS];
-    struct filename *name;
-    struct nameidata *saved;
-    unsigned    root_seq;
-    int     dfd;
-    vfsuid_t    dir_vfsuid;
-    umode_t     dir_mode;
-} __randomize_layout;
-
-struct file *my_path_openat(struct nameidata *nd, const struct open_flags *op, unsigned flags)
-{
-    struct file *file;
-    int error;
-
-    file = alloc_empty_file(op->open_flag, current_cred());
-    if (IS_ERR(file))
-        return file;
-
-    if (unlikely(file->f_flags & __O_TMPFILE)) {
-        error = do_tmpfile(nd, flags, op, file);
-    } else if (unlikely(file->f_flags & O_PATH)) {
-        error = do_o_path(nd, flags, file);
-    } else {
-        const char *s = path_init(nd, flags);
-        while (!(error = link_path_walk(s, nd)) &&
-               (s = open_last_lookups(nd, file, op)) != NULL)
-            ;
-        if (!error)
-            error = do_open(nd, file, op);
-        terminate_walk(nd);
-    }
-    if (likely(!error)) {
-        if (likely(file->f_mode & FMODE_OPENED))
-            return file;
-        WARN_ON(1);
-        error = -EINVAL;
-    }
-    fput(file);
-    if (error == -EOPENSTALE) {
-        if (flags & LOOKUP_RCU)
-            error = -ECHILD;
-        else
-            error = -ESTALE;
-    }
-    return ERR_PTR(error);
-}
-
-struct file *my_do_filp_open(int dfd, struct filename *pathname, const struct open_flags *op)
-{
-    printk("[%s]: start my_do_filp_open", __func__);
-    struct nameidata nd;
-    int flags = op->lookup_flags;
-    struct file *filp;
-
-    set_nameidata(&nd, dfd, pathname, NULL);
-    printk("[%s]: (set_nameidate)total_link_count: %d\n", __func__, nd.total_link_count);
-    filp = path_openat(&nd, op, flags | LOOKUP_RCU);
-    printk("[%s]: (path_openat)flags: ", __func__);
-    if (unlikely(filp == ERR_PTR(-ECHILD)))
-        filp = path_openat(&nd, op, flags);
-    if (unlikely(filp == ERR_PTR(-ESTALE)))
-        filp = path_openat(&nd, op, flags | LOOKUP_REVAL);
-    restore_nameidata();
-    printk("[%s]: finished restore_nameidata(): ", __func__);
-    return filp;
-}
 
 static long my_do_sys_openat2(int dfd, const char __user *filename, struct open_how *how)
 {
