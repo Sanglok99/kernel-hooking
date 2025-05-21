@@ -60,7 +60,7 @@ static long my_do_sys_openat2(int dfd, const char __user *filename, struct open_
     if (IS_ERR(tmp))
         return PTR_ERR(tmp);
 
-    fd = my_get_unused_fd_flags(how->flags); // the "EXPORT_SYMBOL(get_unused_fd_flags);" code exists in the kernel source code, but how is this valid when there is no "extern int get_unused_fd_flags(unsigned flags);"?
+    fd = my_get_unused_fd_flags(how->flags);
     printk("[%s]: fd: %d\n", __func__, fd);
 
     if (fd >= 0) {

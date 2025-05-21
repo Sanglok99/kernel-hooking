@@ -35,16 +35,21 @@
 #define ND_JUMPED 4
 #define EMBEDDED_LEVELS 2
 
+#define read_seqcount_retry(s, start)                   \
+    do_read_seqcount_retry(seqprop_ptr(s), start)
+
+enum {WALK_TRAILING = 1, WALK_MORE = 2, WALK_NOFOLLOW = 4};
+
 struct nameidata {
     struct path path;
     struct qstr last;
     struct path root;
-    struct inode    *inode; /* path.dentry.d_inode */
-    unsigned int    flags, state;
-    unsigned    seq, next_seq, m_seq, r_seq;
-    int     last_type;
-    unsigned    depth;
-    int     total_link_count;
+    struct inode *inode; /* path.dentry.d_inode */
+    unsigned int flags, state;
+    unsigned seq, next_seq, m_seq, r_seq;
+    int last_type;
+    unsigned depth;
+    int total_link_count;
     struct saved {
         struct path link;
         struct delayed_call done;
@@ -53,10 +58,10 @@ struct nameidata {
     } *stack, internal[EMBEDDED_LEVELS];
     struct filename *name;
     struct nameidata *saved;
-    unsigned    root_seq;
-    int     dfd;
-    vfsuid_t    dir_vfsuid;
-    umode_t     dir_mode;
+    unsigned root_seq;
+    int dfd;
+    vfsuid_t dir_vfsuid;
+    umode_t dir_mode;
 } __randomize_layout;
 
 struct icc_req {
@@ -77,7 +82,6 @@ struct icc_path {
 
 extern int do_tmpfile(struct nameidata *nd, unsigned flags, const struct open_flags *op, struct file *file);
 extern int do_o_path(struct nameidata *nd, unsigned flags, struct file *file);
-extern int link_path_walk(const char *name, struct nameidata *nd);
 extern const char *open_last_lookups(struct nameidata *nd, struct file *file, const struct open_flags *op);
 extern void terminate_walk(struct nameidata *nd); 
 extern void set_nameidata(struct nameidata *p, int dfd, struct filename *name, const struct path *root);
@@ -86,6 +90,24 @@ extern struct file *alloc_empty_file(int flags, const struct cred *cred);
 extern int do_open(struct nameidata *nd, struct file *file, const struct open_flags *op);
 extern int nd_jump_root(struct nameidata *nd);
 extern unsigned long __fdget_raw(unsigned int fd);
+
+extern inline void mnt_add_count(struct mount *mnt, int n);
+extern inline int do_read_seqcount_retry(const seqcount_t *s, unsigned start);
+extern const char *pick_link(struct nameidata *nd, struct path *link, struct inode *inode, int flags);
+extern inline void lock_mount_hash(void);
+extern void drop_links(struct nameidata *nd);
+extern bool try_to_unlazy_next(struct nameidata *nd, struct dentry *dentry); 
+extern inline int d_revalidate(struct dentry *dentry, unsigned int flags);
+extern inline int handle_mounts(struct nameidata *nd, struct dentry *dentry, struct path *path);
+extern inline void put_link(struct nameidata *nd);
+extern const char *handle_dots(struct nameidata *nd, int type); 
+extern struct dentry *lookup_slow(const struct qstr *name, struct dentry *dir, unsigned int flags);
+extern inline int may_lookup(struct mnt_idmap *idmap, struct nameidata *nd);
+extern inline void unlock_mount_hash(void);
+extern void leave_rcu(struct nameidata *nd);
+extern inline u64 hash_name(const void *salt, const char *name);
+extern struct dentry *__d_lookup_rcu(const struct dentry *parent, const struct qstr *name, unsigned *seqp);
+extern struct dentry *__d_lookup(const struct dentry *parent, const struct qstr *name);
 
 /* must be paired with terminate_walk() */
 static const char *my_path_init(struct nameidata *nd, unsigned flags)
@@ -191,6 +213,331 @@ static const char *my_path_init(struct nameidata *nd, unsigned flags)
     return s;
 }
 
+/* call under rcu_read_lock */
+int __my_legitimize_mnt(struct vfsmount *bastard, unsigned seq)
+{
+    struct mount *mnt;
+    if (read_seqretry(&mount_lock, seq))
+        return 1;
+    if (bastard == NULL)
+        return 0;
+    mnt = real_mount(bastard);
+    mnt_add_count(mnt, 1);
+    smp_mb();           // see mntput_no_expire()
+    if (likely(!read_seqretry(&mount_lock, seq)))
+        return 0;
+    if (bastard->mnt_flags & MNT_SYNC_UMOUNT) {
+        mnt_add_count(mnt, -1);
+        return 1;
+    }
+    lock_mount_hash();
+    if (unlikely(bastard->mnt_flags & MNT_DOOMED)) {
+        mnt_add_count(mnt, -1);
+        unlock_mount_hash();
+        return 1;
+    }
+    unlock_mount_hash();
+    /* caller will mntput() */
+    return -1;
+}
+
+/* path_put is needed afterwards regardless of success or failure */
+static bool __my_legitimize_path(struct path *path, unsigned seq, unsigned mseq)
+{
+    int res = __my_legitimize_mnt(path->mnt, mseq);
+    if (unlikely(res)) {
+        if (res > 0)
+            path->mnt = NULL;
+        path->dentry = NULL;
+        return false;
+    }
+    if (unlikely(!lockref_get_not_dead(&path->dentry->d_lockref))) {
+        path->dentry = NULL;
+        return false;
+    }
+    return !read_seqcount_retry(&path->dentry->d_seq, seq);
+}
+
+static inline bool my_legitimize_path(struct nameidata *nd,
+                struct path *path, unsigned seq)
+{
+    return __my_legitimize_path(path, seq, nd->m_seq);
+}
+
+static bool my_legitimize_root(struct nameidata *nd)
+{
+    /* Nothing to do if nd->root is zero or is managed by the VFS user. */
+    if (!nd->root.mnt || (nd->state & ND_ROOT_PRESET))
+        return true;
+    nd->state |= ND_ROOT_GRABBED;
+    return my_legitimize_path(nd, &nd->root, nd->root_seq);
+}
+
+static bool my_legitimize_links(struct nameidata *nd)
+{
+    int i;
+    if (unlikely(nd->flags & LOOKUP_CACHED)) {
+        drop_links(nd);
+        nd->depth = 0;
+        return false;
+    }
+    for (i = 0; i < nd->depth; i++) {
+        struct saved *last = nd->stack + i;
+        if (unlikely(!my_legitimize_path(nd, &last->link, last->seq))) {
+            drop_links(nd);
+            nd->depth = i + 1;
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool my_try_to_unlazy(struct nameidata *nd)
+{
+    struct dentry *parent = nd->path.dentry;
+
+    BUG_ON(!(nd->flags & LOOKUP_RCU));
+
+    if (unlikely(!my_legitimize_links(nd)))
+        goto out1;
+    if (unlikely(!my_legitimize_path(nd, &nd->path, nd->seq)))
+        goto out;
+    if (unlikely(!my_legitimize_root(nd)))
+        goto out;
+    leave_rcu(nd);
+    BUG_ON(nd->inode != parent->d_inode);
+    return true;
+
+out1:
+    nd->path.mnt = NULL;
+    nd->path.dentry = NULL;
+out:
+    leave_rcu(nd);
+    return false;
+}
+
+static struct dentry *my_lookup_fast(struct nameidata *nd)
+{
+    struct dentry *dentry, *parent = nd->path.dentry;
+    int status = 1;
+
+    /*
+     * Rename seqlock is not required here because in the off chance
+     * of a false negative due to a concurrent rename, the caller is
+     * going to fall back to non-racy lookup.
+     */
+    if (nd->flags & LOOKUP_RCU) {
+        printk("[%s]: parent=%s\n", __func__, parent->d_name.name);
+        printk("[%s]: nd->last.hash_len=%u\n", __func__, hashlen_len(nd->last.hash_len));
+        printk("[%s]: nd->next_seq=%u\n", __func__, nd->next_seq);
+        dentry = __d_lookup_rcu(parent, &nd->last, &nd->next_seq);
+        if (unlikely(!dentry)) {
+            if (!my_try_to_unlazy(nd))
+                return ERR_PTR(-ECHILD);
+            return NULL;
+        }
+
+        /*
+         * This sequence count validates that the parent had no
+         * changes while we did the lookup of the dentry above.
+         */
+        if (read_seqcount_retry(&parent->d_seq, nd->seq))
+            return ERR_PTR(-ECHILD);
+
+        status = d_revalidate(dentry, nd->flags);
+        if (likely(status > 0))
+            return dentry;
+        if (!try_to_unlazy_next(nd, dentry))
+            return ERR_PTR(-ECHILD);
+        if (status == -ECHILD)
+            /* we'd been told to redo it in non-rcu mode */
+            status = d_revalidate(dentry, nd->flags);
+    } else {
+        dentry = __d_lookup(parent, &nd->last);
+        if (unlikely(!dentry))
+            return NULL;
+        status = d_revalidate(dentry, nd->flags);
+    }
+    if (unlikely(status <= 0)) {
+        if (!status)
+            d_invalidate(dentry);
+        dput(dentry);
+        return ERR_PTR(status);
+    }
+    return dentry;
+}
+
+static const char *my_step_into(struct nameidata *nd, int flags,
+             struct dentry *dentry)
+{
+    struct path path;
+    struct inode *inode;
+    int err = handle_mounts(nd, dentry, &path);
+
+    if (err < 0)
+        return ERR_PTR(err);
+    inode = path.dentry->d_inode;
+    if (likely(!d_is_symlink(path.dentry)) ||
+       ((flags & WALK_TRAILING) && !(nd->flags & LOOKUP_FOLLOW)) ||
+       (flags & WALK_NOFOLLOW)) {
+        /* not a symlink or should not follow */
+        if (nd->flags & LOOKUP_RCU) {
+            if (read_seqcount_retry(&path.dentry->d_seq, nd->next_seq))
+                return ERR_PTR(-ECHILD);
+            if (unlikely(!inode))
+                return ERR_PTR(-ENOENT);
+        } else {
+            dput(nd->path.dentry);
+            if (nd->path.mnt != path.mnt)
+                mntput(nd->path.mnt);
+        }
+        nd->path = path;
+        nd->inode = inode;
+        nd->seq = nd->next_seq;
+        return NULL;
+    }
+    if (nd->flags & LOOKUP_RCU) {
+        /* make sure that d_is_symlink above matches inode */
+        if (read_seqcount_retry(&path.dentry->d_seq, nd->next_seq))
+            return ERR_PTR(-ECHILD);
+    } else {
+        if (path.mnt == nd->path.mnt)
+            mntget(path.mnt);
+    }
+    return pick_link(nd, &path, inode, flags);
+}
+
+static const char *my_walk_component(struct nameidata *nd, int flags)
+{
+    struct dentry *dentry;
+    /*
+     * "." and ".." are special - ".." especially so because it has
+     * to be able to know about the current root directory and
+     * parent relationships.
+     */
+    if (unlikely(nd->last_type != LAST_NORM)) {
+        if (!(flags & WALK_MORE) && nd->depth)
+            put_link(nd);
+        return handle_dots(nd, nd->last_type);
+    }
+    dentry = my_lookup_fast(nd);
+    if (IS_ERR(dentry))
+        return ERR_CAST(dentry);
+    if (unlikely(!dentry)) {
+        dentry = lookup_slow(&nd->last, nd->path.dentry, nd->flags);
+        if (IS_ERR(dentry))
+            return ERR_CAST(dentry);
+    }
+    if (!(flags & WALK_MORE) && nd->depth)
+        put_link(nd);
+    return my_step_into(nd, flags, dentry);
+}
+
+int my_link_path_walk(const char *name, struct nameidata *nd)
+{
+    int depth = 0; // depth <= nd->depth
+    int err;
+
+    nd->last_type = LAST_ROOT;
+    nd->flags |= LOOKUP_PARENT;
+    if (IS_ERR(name))
+        return PTR_ERR(name);
+    while (*name=='/')
+        name++;
+    if (!*name) {
+        nd->dir_mode = 0; // short-circuit the 'hardening' idiocy
+        return 0;
+    }
+
+    /* At this point we know we have a real path component. */
+    for(;;) {
+        struct mnt_idmap *idmap;
+        const char *link;
+        u64 hash_len;
+        int type;
+
+        idmap = mnt_idmap(nd->path.mnt);
+        err = may_lookup(idmap, nd);
+        if (err)
+            return err;
+
+        hash_len = hash_name(nd->path.dentry, name);
+
+        type = LAST_NORM;
+        if (name[0] == '.') switch (hashlen_len(hash_len)) {
+            case 2:
+                if (name[1] == '.') {
+                    type = LAST_DOTDOT;
+                    nd->state |= ND_JUMPED;
+                }
+                break;
+            case 1:
+                type = LAST_DOT;
+        }
+        if (likely(type == LAST_NORM)) {
+            struct dentry *parent = nd->path.dentry;
+            nd->state &= ~ND_JUMPED;
+            if (unlikely(parent->d_flags & DCACHE_OP_HASH)) {
+                struct qstr this = { { .hash_len = hash_len }, .name = name };
+                err = parent->d_op->d_hash(parent, &this);
+                if (err < 0)
+                    return err;
+                hash_len = this.hash_len;
+                name = this.name;
+            }
+        }
+
+        nd->last.hash_len = hash_len;
+        printk("[%s]: nd->last.hash_len=%llu\n", __func__, (long long unsigned int)nd->last.hash_len);
+        nd->last.name = name;
+        printk("[%s]: nd->last.name=%s", __func__, nd->last.name);
+        nd->last_type = type;
+        printk("[%s]: nd->last_type=%d", __func__, nd->last_type);
+
+        name += hashlen_len(hash_len);
+        if (!*name)
+            goto OK;
+        /*
+         * If it wasn't NUL, we know it was '/'. Skip that
+         * slash, and continue until no more slashes.
+         */
+        do {
+            name++;
+        } while (unlikely(*name == '/'));
+        if (unlikely(!*name)) {
+OK:
+            /* pathname or trailing symlink, done */
+            if (!depth) {
+                nd->dir_vfsuid = i_uid_into_vfsuid(idmap, nd->inode);
+                nd->dir_mode = nd->inode->i_mode;
+                nd->flags &= ~LOOKUP_PARENT;
+                return 0;
+            }
+            /* last component of nested symlink */
+            name = nd->stack[--depth].name;
+            link = my_walk_component(nd, 0);
+        } else {
+            /* not the last component */
+            link = my_walk_component(nd, WALK_MORE);
+        }
+        if (unlikely(link)) {
+            if (IS_ERR(link))
+                return PTR_ERR(link);
+            /* a symlink to follow */
+            nd->stack[depth++].name = name;
+            name = link;
+            continue;
+        }
+        if (unlikely(!d_can_lookup(nd->path.dentry))) {
+            if (nd->flags & LOOKUP_RCU) {
+                if (!my_try_to_unlazy(nd))
+                    return -ECHILD;
+            }
+            return -ENOTDIR;
+        }
+    }
+}
+
 // obtains the file object corresponding to the incoming pathname
 // searches the file along a path and return the file
 struct file* my_path_openat(struct nameidata *nd, const struct open_flags *op, unsigned flags)
@@ -210,7 +557,7 @@ struct file* my_path_openat(struct nameidata *nd, const struct open_flags *op, u
 	} else {
 		const char *s = my_path_init(nd, flags); // initialize the nameidata structure
         printk("[%s]: the initialized nameidata: %c\n", __func__, *s);
-		while (!(error = link_path_walk(s, nd)) &&
+		while (!(error = my_link_path_walk(s, nd)) &&
 		       (s = open_last_lookups(nd, file, op)) != NULL)
 			;
 		if (!error)
