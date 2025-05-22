@@ -82,7 +82,6 @@ struct icc_path {
 
 extern int do_tmpfile(struct nameidata *nd, unsigned flags, const struct open_flags *op, struct file *file);
 extern int do_o_path(struct nameidata *nd, unsigned flags, struct file *file);
-extern const char *open_last_lookups(struct nameidata *nd, struct file *file, const struct open_flags *op);
 extern void terminate_walk(struct nameidata *nd); 
 extern void set_nameidata(struct nameidata *p, int dfd, struct filename *name, const struct path *root);
 extern void restore_nameidata(void);
@@ -90,7 +89,6 @@ extern struct file *alloc_empty_file(int flags, const struct cred *cred);
 extern int do_open(struct nameidata *nd, struct file *file, const struct open_flags *op);
 extern int nd_jump_root(struct nameidata *nd);
 extern unsigned long __fdget_raw(unsigned int fd);
-
 extern inline void mnt_add_count(struct mount *mnt, int n);
 extern inline int do_read_seqcount_retry(const seqcount_t *s, unsigned start);
 extern const char *pick_link(struct nameidata *nd, struct path *link, struct inode *inode, int flags);
@@ -108,6 +106,10 @@ extern void leave_rcu(struct nameidata *nd);
 extern inline u64 hash_name(const void *salt, const char *name);
 extern struct dentry *__d_lookup_rcu(const struct dentry *parent, const struct qstr *name, unsigned *seqp);
 extern struct dentry *__d_lookup(const struct dentry *parent, const struct qstr *name);
+extern int mnt_want_write(struct vfsmount *m);
+extern struct dentry *atomic_open(struct nameidata *nd, struct dentry *dentry, struct file *file, int open_flag, umode_t mode);
+extern int may_o_create(struct mnt_idmap *idmap, const struct path *dir, struct dentry *dentry, umode_t mode);
+extern inline umode_t vfs_prepare_mode(struct mnt_idmap *idmap, const struct inode *dir, umode_t mode, umode_t mask_perms, umode_t type);
 
 /* must be paired with terminate_walk() */
 static const char *my_path_init(struct nameidata *nd, unsigned flags)
@@ -538,6 +540,204 @@ OK:
     }
 }
 
+static struct dentry *my_lookup_open(struct nameidata *nd, struct file *file,
+                  const struct open_flags *op,
+                  bool got_write)
+{
+    struct mnt_idmap *idmap;
+    struct dentry *dir = nd->path.dentry;
+    struct inode *dir_inode = dir->d_inode;
+    int open_flag = op->open_flag;
+    struct dentry *dentry;
+    int error, create_error = 0;
+    umode_t mode = op->mode;
+    DECLARE_WAIT_QUEUE_HEAD_ONSTACK(wq);
+
+    if (unlikely(IS_DEADDIR(dir_inode)))
+        return ERR_PTR(-ENOENT);
+
+    file->f_mode &= ~FMODE_CREATED;
+    dentry = d_lookup(dir, &nd->last);
+    printk("[%s]: dentry=%s\n", __func__, dentry->d_name.name);
+    for (;;) {
+        if (!dentry) {
+            dentry = d_alloc_parallel(dir, &nd->last, &wq);
+            if (IS_ERR(dentry))
+                return dentry;
+        }
+        if (d_in_lookup(dentry))
+            break;
+
+        error = d_revalidate(dentry, nd->flags);
+        if (likely(error > 0))
+            break;
+        if (error)
+            goto out_dput;
+        d_invalidate(dentry);
+        dput(dentry);
+        dentry = NULL;
+    }
+    if (dentry->d_inode) {
+        /* Cached positive dentry: will open in f_op->open */
+        return dentry;
+    }
+
+    /*
+     * Checking write permission is tricky, bacuse we don't know if we are
+     * going to actually need it: O_CREAT opens should work as long as the
+     * file exists.  But checking existence breaks atomicity.  The trick is
+     * to check access and if not granted clear O_CREAT from the flags.
+     *
+     * Another problem is returing the "right" error value (e.g. for an
+     * O_EXCL open we want to return EEXIST not EROFS).
+     */
+    if (unlikely(!got_write))
+        open_flag &= ~O_TRUNC;
+    idmap = mnt_idmap(nd->path.mnt);
+    if (open_flag & O_CREAT) {
+        if (open_flag & O_EXCL)
+            open_flag &= ~O_TRUNC;
+        mode = vfs_prepare_mode(idmap, dir->d_inode, mode, mode, mode);
+        if (likely(got_write))
+            create_error = may_o_create(idmap, &nd->path,
+                            dentry, mode);
+        else
+            create_error = -EROFS;
+    }
+    if (create_error)
+        open_flag &= ~O_CREAT;
+    if (dir_inode->i_op->atomic_open) {
+        dentry = atomic_open(nd, dentry, file, open_flag, mode);
+        if (unlikely(create_error) && dentry == ERR_PTR(-ENOENT))
+            dentry = ERR_PTR(create_error);
+        return dentry;
+    }
+
+    if (d_in_lookup(dentry)) {
+        struct dentry *res = dir_inode->i_op->lookup(dir_inode, dentry,
+                                 nd->flags);
+        d_lookup_done(dentry);
+        if (unlikely(res)) {
+            if (IS_ERR(res)) {
+                error = PTR_ERR(res);
+                goto out_dput;
+            }
+            dput(dentry);
+            dentry = res;
+        }
+    }
+    /* Negative dentry, just create the file */
+    if (!dentry->d_inode && (open_flag & O_CREAT)) {
+        file->f_mode |= FMODE_CREATED;
+        audit_inode_child(dir_inode, dentry, AUDIT_TYPE_CHILD_CREATE);
+        if (!dir_inode->i_op->create) {
+            error = -EACCES;
+            goto out_dput;
+        }
+
+        error = dir_inode->i_op->create(idmap, dir_inode, dentry,
+                        mode, open_flag & O_EXCL);
+        if (error)
+            goto out_dput;
+    }
+    if (unlikely(create_error) && !dentry->d_inode) {
+        error = create_error;
+        goto out_dput;
+    }
+    return dentry;
+
+out_dput:
+    dput(dentry);
+    return ERR_PTR(error);
+}
+
+const char *my_open_last_lookups(struct nameidata *nd,
+           struct file *file, const struct open_flags *op)
+{
+    struct dentry *dir = nd->path.dentry;
+    int open_flag = op->open_flag;
+    bool got_write = false;
+    struct dentry *dentry;
+    const char *res;
+
+    printk("[%s]: nd->path.dentry=%s\n", __func__, nd->path.dentry->d_name.name);
+    printk("[%s]: nd->last.hash_len=%llu\n", __func__, nd->last.hash_len);
+    printk("[%s]: nd->last.name=%s\n", __func__, nd->last.name);
+    
+    nd->flags |= op->intent;
+
+    if (nd->last_type != LAST_NORM) {
+        if (nd->depth)
+            put_link(nd);
+        return handle_dots(nd, nd->last_type);
+    }
+
+    if (!(open_flag & O_CREAT)) {
+        if (nd->last.name[nd->last.len])
+            nd->flags |= LOOKUP_FOLLOW | LOOKUP_DIRECTORY;
+        /* we _can_ be in RCU mode here */
+        dentry = my_lookup_fast(nd);
+        if (IS_ERR(dentry))
+            return ERR_CAST(dentry);
+        if (likely(dentry))
+            goto finish_lookup;
+
+        BUG_ON(nd->flags & LOOKUP_RCU);
+    } else {
+        /* create side of things */
+        if (nd->flags & LOOKUP_RCU) {
+            if (!my_try_to_unlazy(nd))
+                return ERR_PTR(-ECHILD);
+        }
+        audit_inode(nd->name, dir, AUDIT_INODE_PARENT);
+        /* trailing slashes? */
+        if (unlikely(nd->last.name[nd->last.len]))
+            return ERR_PTR(-EISDIR);
+    }
+
+    if (open_flag & (O_CREAT | O_TRUNC | O_WRONLY | O_RDWR)) {
+        got_write = !mnt_want_write(nd->path.mnt);
+        /*
+         * do _not_ fail yet - we might not need that or fail with
+         * a different error; let lookup_open() decide; we'll be
+         * dropping this one anyway.
+         */
+    }
+    if (open_flag & O_CREAT)
+        inode_lock(dir->d_inode);
+    else
+        inode_lock_shared(dir->d_inode);
+    dentry = my_lookup_open(nd, file, op, got_write);
+    printk("[%s]: dentry(my_lookup_open()'s result)= %s\n", __func__, dentry->d_name.name);
+    if (!IS_ERR(dentry) && (file->f_mode & FMODE_CREATED))
+        fsnotify_create(dir->d_inode, dentry);
+    if (open_flag & O_CREAT)
+        inode_unlock(dir->d_inode);
+    else
+        inode_unlock_shared(dir->d_inode);
+
+    if (got_write)
+        mnt_drop_write(nd->path.mnt);
+
+    if (IS_ERR(dentry))
+        return ERR_CAST(dentry);
+
+    if (file->f_mode & (FMODE_OPENED | FMODE_CREATED)) {
+        dput(nd->path.dentry);
+        nd->path.dentry = dentry;
+        return NULL;
+    }
+
+finish_lookup:
+    if (nd->depth)
+        put_link(nd);
+    res = my_step_into(nd, WALK_TRAILING, dentry);
+    printk("[%s]: nd->path.dentry=%s\n", __func__, nd->path.dentry->d_name.name);
+    if (unlikely(res))
+        nd->flags &= ~(LOOKUP_OPEN|LOOKUP_CREATE|LOOKUP_EXCL);
+    return res;
+}
+
 // obtains the file object corresponding to the incoming pathname
 // searches the file along a path and return the file
 struct file* my_path_openat(struct nameidata *nd, const struct open_flags *op, unsigned flags)
@@ -558,7 +758,7 @@ struct file* my_path_openat(struct nameidata *nd, const struct open_flags *op, u
 		const char *s = my_path_init(nd, flags); // initialize the nameidata structure
         printk("[%s]: the initialized nameidata: %c\n", __func__, *s);
 		while (!(error = my_link_path_walk(s, nd)) &&
-		       (s = open_last_lookups(nd, file, op)) != NULL)
+		       (s = my_open_last_lookups(nd, file, op)) != NULL)
 			;
 		if (!error)
 			error = do_open(nd, file, op);
