@@ -13,6 +13,7 @@ PWD := $(shell pwd)
 open_syscall_module-y	+= fs/open.o
 open_syscall_module-y	+= fs/file.o
 open_syscall_module-y	+= fs/namei.o
+open_syscall_module-y	+= fs/ext4/namei.o
 
 default:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules

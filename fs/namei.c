@@ -27,6 +27,7 @@
 
 #include "internal.h"
 #include "mount.h"
+#include "ext4/example.h"
 
 #define __getname()     kmem_cache_alloc(names_cachep, GFP_KERNEL)
 #define EMBEDDED_NAME_MAX	(PATH_MAX - offsetof(struct filename, iname))
@@ -110,6 +111,11 @@ extern int mnt_want_write(struct vfsmount *m);
 extern struct dentry *atomic_open(struct nameidata *nd, struct dentry *dentry, struct file *file, int open_flag, umode_t mode);
 extern int may_o_create(struct mnt_idmap *idmap, const struct path *dir, struct dentry *dentry, umode_t mode);
 extern inline umode_t vfs_prepare_mode(struct mnt_idmap *idmap, const struct inode *dir, umode_t mode, umode_t mask_perms, umode_t type);
+
+static inline bool is_ext4_inode(struct inode *inode)
+{
+    return inode->i_sb->s_magic == EXT4_SUPER_MAGIC;
+}
 
 /* must be paired with terminate_walk() */
 static const char *my_path_init(struct nameidata *nd, unsigned flags)
@@ -630,13 +636,24 @@ static struct dentry *my_lookup_open(struct nameidata *nd, struct file *file,
     if (!dentry->d_inode && (open_flag & O_CREAT)) {
         file->f_mode |= FMODE_CREATED;
         audit_inode_child(dir_inode, dentry, AUDIT_TYPE_CHILD_CREATE);
+        
+		/*
         if (!dir_inode->i_op->create) {
             error = -EACCES;
             goto out_dput;
         }
 
-        error = dir_inode->i_op->create(idmap, dir_inode, dentry,
-                        mode, open_flag & O_EXCL);
+        error = dir_inode->i_op->create(idmap, dir_inode, dentry, mode, open_flag & O_EXCL);
+        */
+
+		// ================= customized ext4 entry point ==========================
+		if (!is_ext4_inode(dir_inode)) {
+    		error = -EACCES;
+    		goto out_dput;
+		}
+
+		error = my_ext4_create(idmap, dir_inode, dentry, mode, open_flag & O_EXCL);
+		// ========================================================================
         if (error)
             goto out_dput;
     }
